@@ -14,6 +14,7 @@ import {Logger} from "../logger/Logger";
 import {EntityMetadataNotFoundError} from "../error/EntityMetadataNotFoundError";
 import {MigrationInterface} from "../migration/MigrationInterface";
 import {MigrationExecutor} from "../migration/MigrationExecutor";
+import {Migration} from "../migration/Migration";
 import {MongoRepository} from "../repository/MongoRepository";
 import {MongoDriver} from "../driver/mongodb/MongoDriver";
 import {MongoEntityManager} from "../entity-manager/MongoEntityManager";
@@ -34,7 +35,11 @@ import {RelationIdLoader} from "../query-builder/RelationIdLoader";
 import {EntitySchema} from "../";
 import {SqlServerDriver} from "../driver/sqlserver/SqlServerDriver";
 import {MysqlDriver} from "../driver/mysql/MysqlDriver";
+import {ObjectUtils} from "../util/ObjectUtils";
 import {PromiseUtils} from "../";
+import {IsolationLevel} from "../driver/types/IsolationLevel";
+import { EntityFactoryInterface } from '../entity-factory/EntityFactoryInterface';
+import { DefaultEntityFactory } from '../entity-factory/DefaultEntityFactory';
 
 /**
  * Connection is a single database ORM connection to a specific database.
@@ -93,6 +98,11 @@ export class Connection {
     readonly subscribers: EntitySubscriberInterface<any>[] = [];
 
     /**
+     * Entity factory used to instantiate entities objects
+     */
+    readonly entityFactory: EntityFactoryInterface;
+
+    /**
      * Observers observing queries.
      */
     readonly observers: QueryObserver[] = [];
@@ -128,6 +138,7 @@ export class Connection {
         this.driver = new DriverFactory().create(this);
         this.manager = this.createEntityManager();
         this.namingStrategy = options.namingStrategy || new DefaultNamingStrategy();
+        this.entityFactory = options.entityFactory || new DefaultEntityFactory();
         this.queryResultCache = options.cache ? new QueryResultCacheFactory(this).create() : undefined;
         this.relationLoader = new RelationLoader(this);
         this.relationIdLoader = new RelationIdLoader(this);
@@ -184,7 +195,7 @@ export class Connection {
             await this.queryResultCache.connect();
 
         // set connected status for the current connection
-        Object.assign(this, { isConnected: true });
+        ObjectUtils.assign(this, { isConnected: true });
 
         try {
 
@@ -230,7 +241,7 @@ export class Connection {
         if (this.queryResultCache)
             await this.queryResultCache.disconnect();
 
-        Object.assign(this, { isConnected: false });
+        ObjectUtils.assign(this, { isConnected: false });
     }
 
     /**
@@ -259,24 +270,27 @@ export class Connection {
     // TODO rename
     async dropDatabase(): Promise<void> {
         const queryRunner = await this.createQueryRunner("master");
-        if (this.driver instanceof SqlServerDriver || this.driver instanceof MysqlDriver) {
-            const databases: string[] = this.driver.database ? [this.driver.database] : [];
-            this.entityMetadatas.forEach(metadata => {
-                if (metadata.database && databases.indexOf(metadata.database) === -1)
-                    databases.push(metadata.database);
-            });
-            await PromiseUtils.runInSequence(databases, database => queryRunner.clearDatabase(database));
-        } else {
-            await queryRunner.clearDatabase();
+        try {
+            if (this.driver instanceof SqlServerDriver || this.driver instanceof MysqlDriver) {
+                const databases: string[] = this.driver.database ? [this.driver.database] : [];
+                this.entityMetadatas.forEach(metadata => {
+                    if (metadata.database && databases.indexOf(metadata.database) === -1)
+                        databases.push(metadata.database);
+                });
+                await PromiseUtils.runInSequence(databases, database => queryRunner.clearDatabase(database));
+            } else {
+                await queryRunner.clearDatabase();
+            }
+        } finally {
+            await queryRunner.release();
         }
-        await queryRunner.release();
     }
 
     /**
      * Runs all pending migrations.
      * Can be used only after connection to the database is established.
      */
-    async runMigrations(options?: { transaction?: boolean }): Promise<void> {
+    async runMigrations(options?: { transaction?: boolean }): Promise<Migration[]> {
         if (!this.isConnected)
             throw new CannotExecuteNotConnectedError(this.name);
 
@@ -284,7 +298,8 @@ export class Connection {
         if (options && options.transaction === false) {
             migrationExecutor.transaction = false;
         }
-        await migrationExecutor.executePendingMigrations();
+        const successMigrations = await migrationExecutor.executePendingMigrations();
+        return successMigrations;
     }
 
     /**
@@ -358,8 +373,16 @@ export class Connection {
      * Wraps given function execution (and all operations made there) into a transaction.
      * All database operations must be executed using provided entity manager.
      */
-    async transaction(runInTransaction: (entityManager: EntityManager) => Promise<any>): Promise<any> {
-        return this.manager.transaction(runInTransaction);
+    async transaction<T>(runInTransaction: (entityManager: EntityManager) => Promise<T>): Promise<T>;
+    async transaction<T>(isolationLevel: IsolationLevel, runInTransaction: (entityManager: EntityManager) => Promise<T>): Promise<T>;
+    async transaction<T>(
+        isolationOrRunInTransaction: IsolationLevel | ((entityManager: EntityManager) => Promise<T>),
+        runInTransactionParam?: (entityManager: EntityManager) => Promise<T>
+    ): Promise<any> {
+        return this.manager.transaction(
+            isolationOrRunInTransaction as any,
+            runInTransactionParam as any
+        );
     }
 
     /**
@@ -485,15 +508,15 @@ export class Connection {
 
         // create subscribers instances if they are not disallowed from high-level (for example they can disallowed from migrations run process)
         const subscribers = connectionMetadataBuilder.buildSubscribers(this.options.subscribers || []);
-        Object.assign(this, { subscribers: subscribers });
+        ObjectUtils.assign(this, { subscribers: subscribers });
 
         // build entity metadatas
         const entityMetadatas = connectionMetadataBuilder.buildEntityMetadatas(this.options.entities || []);
-        Object.assign(this, { entityMetadatas: entityMetadatas });
+        ObjectUtils.assign(this, { entityMetadatas: entityMetadatas });
 
         // create migration instances
         const migrations = connectionMetadataBuilder.buildMigrations(this.options.migrations || []);
-        Object.assign(this, { migrations: migrations });
+        ObjectUtils.assign(this, { migrations: migrations });
 
         // validate all created entity metadatas to make sure user created entities are valid and correct
         entityMetadataValidator.validateMany(this.entityMetadatas, this.driver);

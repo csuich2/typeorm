@@ -34,7 +34,6 @@ import {AbstractSqliteDriver} from "../driver/sqlite-abstract/AbstractSqliteDriv
 import {QueryResultCacheOptions} from "../cache/QueryResultCacheOptions";
 import {OffsetWithoutLimitNotSupportedError} from "../error/OffsetWithoutLimitNotSupportedError";
 import {BroadcasterResult} from "../subscriber/BroadcasterResult";
-import {abbreviate} from "../util/StringUtils";
 import {SelectQueryBuilderOption} from "./SelectQueryBuilderOption";
 import {
     FindOptions,
@@ -46,6 +45,8 @@ import {RelationMetadata} from "../metadata/RelationMetadata";
 import {FindCriteriaNotFoundError} from "../error/FindCriteriaNotFoundError";
 import {FindOperator} from "../find-options/FindOperator";
 import {OrmUtils} from "../util/OrmUtils";
+import {ObjectUtils} from "../util/ObjectUtils";
+import {DriverUtils} from "../driver/DriverUtils";
 
 /**
  * Allows to build complex sql queries in a fashion way and execute those queries.
@@ -801,7 +802,7 @@ export class SelectQueryBuilder<Entity> extends QueryBuilder<Entity> implements 
      * for example [{ firstId: 1, secondId: 2 }, { firstId: 2, secondId: 3 }, ...]
      */
     andWhereInIds(ids: any|any[]): this {
-        return this.andWhere("(" + this.createWhereIdsExpression(ids) + ")");
+        return this.andWhere(this.createWhereIdsExpression(ids));
     }
 
     /**
@@ -813,7 +814,7 @@ export class SelectQueryBuilder<Entity> extends QueryBuilder<Entity> implements 
      * for example [{ firstId: 1, secondId: 2 }, { firstId: 2, secondId: 3 }, ...]
      */
     orWhereInIds(ids: any|any[]): this {
-        return this.orWhere("(" + this.createWhereIdsExpression(ids) + ")");
+        return this.orWhere(this.createWhereIdsExpression(ids));
     }
 
     /**
@@ -1617,13 +1618,22 @@ export class SelectQueryBuilder<Entity> extends QueryBuilder<Entity> implements 
         }
 
         if (this.connection.driver instanceof SqlServerDriver) {
+            // Due to a limitation in SQL Server's parser implementation it does not support using
+            // OFFSET or FETCH NEXT without an ORDER BY clause being provided. In cases where the
+            // user does not request one we insert a dummy ORDER BY that does nothing and should
+            // have no effect on the query planner or on the order of the results returned.
+            // https://dba.stackexchange.com/a/193799
+            let prefix = "";
+            if ((limit || offset) && Object.keys(this.expressionMap.allOrderBys).length <= 0) {
+                prefix = " ORDER BY (SELECT NULL)";
+            }
 
             if (limit && offset)
-                return " OFFSET " + offset + " ROWS FETCH NEXT " + limit + " ROWS ONLY";
+                return prefix + " OFFSET " + offset + " ROWS FETCH NEXT " + limit + " ROWS ONLY";
             if (limit)
-                return " OFFSET 0 ROWS FETCH NEXT " + limit + " ROWS ONLY";
+                return prefix + " OFFSET 0 ROWS FETCH NEXT " + limit + " ROWS ONLY";
             if (offset)
-                return " OFFSET " + offset + " ROWS";
+                return prefix + " OFFSET " + offset + " ROWS";
 
         } else if (this.connection.driver instanceof MysqlDriver) {
 
@@ -1757,7 +1767,7 @@ export class SelectQueryBuilder<Entity> extends QueryBuilder<Entity> implements 
             }
             return {
                 selection: selectionPath,
-                aliasName: selection && selection.aliasName ? selection.aliasName : this.buildColumnAlias(aliasName, column.databaseName),
+                aliasName: selection && selection.aliasName ? selection.aliasName : DriverUtils.buildColumnAlias(this.connection.driver, aliasName, column.databaseName),
                 // todo: need to keep in mind that custom selection.aliasName breaks hydrator. fix it later!
                 virtual: selection ? selection.virtual === true : (hasMainAlias ? false : true),
             };
@@ -1852,10 +1862,18 @@ export class SelectQueryBuilder<Entity> extends QueryBuilder<Entity> implements 
 
             if (this.expressionMap.eagerRelations === true) {
                 if (!this.findOptions.options || this.findOptions.options.eagerRelations !== false) {
+                    // Create a list of all of the alias+propertyPaths that were manually joined, so we don't join them again
+                    const manuallyJoinedRelations = this.expressionMap.joinAttributes
+                                                        .filter(join => join.relationPropertyPath)
+                                                        .map(join => join.parentAlias + "." + join.relationPropertyPath);
                     const joinEagerRelations = (alias: string, metadata: EntityMetadata) => {
                         metadata.eagerRelations.forEach(relation => {
                             const relationAlias = alias + "_" + relation.propertyPath.replace(".", "_");
-                            this.leftJoinAndSelect(alias + "." + relation.propertyPath, relationAlias);
+                            const path = alias + "." + relation.propertyPath;
+                            if (manuallyJoinedRelations.indexOf(path) === -1) {
+                                // This alias+propertyPath was already joined manually
+                                this.leftJoinAndSelect(path, relationAlias);
+                            }
                             joinEagerRelations(relationAlias, relation.inverseEntityMetadata);
                         });
                     };
@@ -1975,10 +1993,10 @@ export class SelectQueryBuilder<Entity> extends QueryBuilder<Entity> implements 
 
             const querySelects = metadata.primaryColumns.map(primaryColumn => {
                 const distinctAlias = this.escape("distinctAlias");
-                const columnAlias = this.escape(this.buildColumnAlias(mainAliasName, primaryColumn.databaseName));
+                const columnAlias = this.escape(DriverUtils.buildColumnAlias(this.connection.driver, mainAliasName, primaryColumn.databaseName));
                 if (!orderBys[columnAlias]) // make sure we aren't overriding user-defined order in inverse direction
                     orderBys[columnAlias] = "ASC";
-                return `${distinctAlias}.${columnAlias} as "ids_${this.buildColumnAlias(mainAliasName, primaryColumn.databaseName)}"`;
+                return `${distinctAlias}.${columnAlias} as "ids_${DriverUtils.buildColumnAlias(this.connection.driver, mainAliasName, primaryColumn.databaseName)}"`;
             });
 
             const clonnedQb = cloneQb1
@@ -1988,8 +2006,7 @@ export class SelectQueryBuilder<Entity> extends QueryBuilder<Entity> implements 
                 //     options: this.findOptions.options,
                 //     where: this.findOptions.where
                 // })
-                .orderBy()
-                .groupBy();
+                .orderBy();
 
             rawResults = await new SelectQueryBuilder(this.connection, queryRunner)
                 .select(`DISTINCT ${querySelects.join(", ")}`)
@@ -2014,7 +2031,7 @@ export class SelectQueryBuilder<Entity> extends QueryBuilder<Entity> implements 
                         }).join(" AND ");
                     }).join(" OR ");
                 } else {
-                    const ids = rawResults.map(result => result["ids_" + this.buildColumnAlias(mainAliasName, metadata.primaryColumns[0].databaseName)]);
+                    const ids = rawResults.map(result => result["ids_" + DriverUtils.buildColumnAlias(this.connection.driver, mainAliasName, metadata.primaryColumns[0].databaseName)]);
                     const areAllNumbers = ids.every((id: any) => typeof id === "number");
                     if (areAllNumbers) {
                         // fixes #190. if all numbers then its safe to perform query without parameter
@@ -2096,7 +2113,7 @@ export class SelectQueryBuilder<Entity> extends QueryBuilder<Entity> implements 
                     const [aliasName, propertyPath] = QueryBuilderUtils.extractAliasAndPropertyPath(orderCriteria);
                     const alias = this.expressionMap.findAliasByName(aliasName);
                     const column = alias.metadata.findColumnWithPropertyPath(propertyPath);
-                    return this.escape(parentAlias) + "." + this.escape(this.buildColumnAlias(aliasName, column!.databaseName));
+                    return this.escape(parentAlias) + "." + this.escape(DriverUtils.buildColumnAlias(this.connection.driver, aliasName, column!.databaseName));
                 } else {
                     if (this.expressionMap.selects.find(select => select.selection === orderCriteria || select.aliasName === orderCriteria))
                         return this.escape(parentAlias) + "." + orderCriteria;
@@ -2112,7 +2129,7 @@ export class SelectQueryBuilder<Entity> extends QueryBuilder<Entity> implements 
                 const [aliasName, propertyPath] = QueryBuilderUtils.extractAliasAndPropertyPath(orderCriteria);
                 const alias = this.expressionMap.findAliasByName(aliasName);
                 const column = alias.metadata.findColumnWithPropertyPath(propertyPath);
-                orderByObject[this.escape(parentAlias) + "." + this.escape(this.buildColumnAlias(aliasName, column!.databaseName))] = orderBys[orderCriteria];
+                orderByObject[this.escape(parentAlias) + "." + this.escape(DriverUtils.buildColumnAlias(this.connection.driver, aliasName, column!.databaseName))] = orderBys[orderCriteria];
             } else {
                 if (this.expressionMap.selects.find(select => select.selection === orderCriteria || select.aliasName === orderCriteria)) {
                     orderByObject[this.escape(parentAlias) + "." + orderCriteria] = orderBys[orderCriteria];
@@ -2159,22 +2176,10 @@ export class SelectQueryBuilder<Entity> extends QueryBuilder<Entity> implements 
     }
 
     /**
-     * Builds column alias from given alias name and column name,
-     * If alias length is more than 29, abbreviates column name.
-     */
-    protected buildColumnAlias(aliasName: string, columnName: string): string {
-        const columnAliasName = aliasName + "_" + columnName;
-        if (columnAliasName.length > 29 && this.connection.driver instanceof OracleDriver)
-            return aliasName  + "_" + abbreviate(columnName, 2);
-
-        return columnAliasName;
-    }
-
-    /**
      * Merges into expression map given expression map properties.
      */
     protected mergeExpressionMap(expressionMap: Partial<QueryExpressionMap>): this {
-        Object.assign(this.expressionMap, expressionMap);
+        ObjectUtils.assign(this.expressionMap, expressionMap);
         return this;
     }
 
@@ -2199,7 +2204,7 @@ export class SelectQueryBuilder<Entity> extends QueryBuilder<Entity> implements 
 
         if (select instanceof Array) {
             select.forEach(select => {
-                this.selects.push(this.expressionMap.mainAlias!.name + "." + select);
+                this.selects.push(this.expressionMap.mainAlias!.name + "." + (select as string));
             });
 
         } else {
@@ -2239,7 +2244,7 @@ export class SelectQueryBuilder<Entity> extends QueryBuilder<Entity> implements 
         }
     }
 
-    protected buildRelations(relations: FindOptionsRelation<any>, metadata: EntityMetadata, embedPrefix?: string) {
+    protected buildRelations(relations: FindOptionsRelation<any>|any, metadata: EntityMetadata, embedPrefix?: string) {
         if (!relations)
             return;
 
@@ -2315,7 +2320,7 @@ export class SelectQueryBuilder<Entity> extends QueryBuilder<Entity> implements 
         }
     }
 
-    protected buildWhere(where: FindOptionsWhere<any>, metadata: EntityMetadata, alias: string, embedPrefix?: string): string {
+    protected buildWhere(where: any, metadata: EntityMetadata, alias: string, embedPrefix?: string): string {
         let condition: string = "";
         let parameterIndex = Object.keys(this.expressionMap.nativeParameters).length;
         if (where instanceof Array) {
@@ -2381,23 +2386,72 @@ export class SelectQueryBuilder<Entity> extends QueryBuilder<Entity> implements 
                         andConditions.push(condition);
 
                 } else if (relation) {
-                    const joinAlias = alias + "_" + relation.propertyName;
-                    const existJoin = this.joins.find(join => join.alias === joinAlias);
-                    if (!existJoin) {
-                        this.joins.push({
-                            type: "inner",
-                            select: false,
-                            alias: joinAlias,
-                            parentAlias: alias,
-                            relationMetadata: relation
-                        });
-                    } else {
-                        if (existJoin.type === "left")
-                            existJoin.type = "inner";
+
+                    // if all properties of where are undefined we don't need to join anything
+                    // this can happen when user defines map with conditional queries inside
+                    if (where[key] instanceof Object) {
+                        const allAllUndefined = Object.keys(where[key]).every(k => where[key][k] === undefined);
+                        if (allAllUndefined) {
+                            continue;
+                        }
                     }
-                    const condition = this.buildWhere(where[key], relation.inverseEntityMetadata, joinAlias);
-                    if (condition)
-                        andConditions.push(condition);
+
+                    if (where[key] instanceof FindOperator) {
+                        if (where[key].type === "moreThan" || where[key].type === "lessThan") {
+                            const sqlOperator = where[key].type === "moreThan" ? ">" : "<";
+                            // basically relation count functionality
+                            const qb: QueryBuilder<any> = this.subQuery();
+                            if (relation.isManyToManyOwner) {
+                                qb.select("COUNT(*)")
+                                    .from(relation.joinTableName, relation.joinTableName)
+                                    .where(relation.joinColumns.map(column => {
+                                        return `${relation.joinTableName}.${column.propertyName} = ${alias}.${column.referencedColumn!.propertyName}`;
+                                    }).join(" AND "));
+
+                            } else if (relation.isManyToManyNotOwner) {
+                                qb.select("COUNT(*)")
+                                    .from(relation.inverseRelation!.joinTableName, relation.inverseRelation!.joinTableName)
+                                    .where(relation.inverseRelation!.inverseJoinColumns.map(column => {
+                                        return `${relation.inverseRelation!.joinTableName}.${column.propertyName} = ${alias}.${column.referencedColumn!.propertyName}`;
+                                    }).join(" AND "));
+
+                            } else if (relation.isOneToMany) {
+                                qb.select("COUNT(*)")
+                                    .from(relation.inverseEntityMetadata.target, relation.inverseEntityMetadata.tableName)
+                                    .where(relation.inverseRelation!.joinColumns.map(column => {
+                                        return `${relation.inverseEntityMetadata.tableName}.${column.propertyName} = ${alias}.${column.referencedColumn!.propertyName}`;
+                                    }).join(" AND "));
+
+                            } else {
+                                throw new Error(`This relation isn't supported by given find operator`);
+                            }
+                            // this
+                            //     .addSelect(qb.getSql(), relation.propertyAliasName + "_cnt")
+                            //     .andWhere(this.escape(relation.propertyAliasName + "_cnt") + " " + sqlOperator + " " + parseInt(where[key].value));
+                            this.andWhere((qb.getSql()) + " " + sqlOperator + " " + parseInt(where[key].value));
+                        }
+
+                    } else {
+
+                        const joinAlias = alias + "_" + relation.propertyName;
+                        const existJoin = this.joins.find(join => join.alias === joinAlias);
+                        if (!existJoin) {
+                            this.joins.push({
+                                type: "inner",
+                                select: false,
+                                alias: joinAlias,
+                                parentAlias: alias,
+                                relationMetadata: relation
+                            });
+                        } else {
+                            if (existJoin.type === "left")
+                                existJoin.type = "inner";
+                        }
+
+                        const condition = this.buildWhere(where[key], relation.inverseEntityMetadata, joinAlias);
+                        if (condition)
+                            andConditions.push(condition);
+                    }
                 }
             }
             condition = andConditions.join(" AND ");
